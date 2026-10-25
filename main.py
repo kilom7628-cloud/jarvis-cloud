@@ -35,6 +35,12 @@ logger = logging.getLogger("jarvis-cloud")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
+GROQ_REASONING = os.getenv("GROQ_REASONING", "low")
+
+# Google Gemini (primary — free, ~1500 req/day, ~1M tokens/min)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 FISH_API_KEY = os.getenv("FISH_API_KEY", "")
 FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "05b36da8574341d0803391491850db20")
 FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free")
@@ -68,6 +74,73 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# AI Provider Chain — Gemini → Groq → Gemini Fallback
+# ---------------------------------------------------------------------------
+def _build_providers(is_vision: bool = False):
+    """Build the ordered list of AI providers to try."""
+    providers = []
+    if GEMINI_API_KEY:
+        providers.append(("Gemini 3.5 Flash", GEMINI_URL, GEMINI_API_KEY, "gemini-3.5-flash"))
+        providers.append(("Gemini 3.6 Flash", GEMINI_URL, GEMINI_API_KEY, "gemini-3.6-flash"))
+    if GROQ_API_KEY:
+        model = GROQ_VISION_MODEL if is_vision else GROQ_MODEL
+        providers.append(("Groq", GROQ_CHAT_URL, GROQ_API_KEY, model))
+    if GEMINI_API_KEY:
+        providers.append(("Gemini Lite", GEMINI_URL, GEMINI_API_KEY, "gemini-3.1-flash-lite"))
+    return providers
+
+
+async def _ai_chat(payload: dict, timeout: float = 90.0) -> dict:
+    """
+    Call AI with automatic fallback chain: Gemini → Groq → Gemini-fallback.
+    Returns the parsed JSON response from whichever provider succeeds first.
+    """
+    is_vision = any(
+        isinstance(m.get("content"), list) and any(
+            isinstance(c, dict) and c.get("type") == "image_url" for c in m["content"]
+        )
+        for m in payload.get("messages", []) if isinstance(m, dict)
+    )
+
+    providers = _build_providers(is_vision)
+    if not providers:
+        raise HTTPException(status_code=500, detail="No AI API keys configured")
+
+    last_err = None
+    for name, url, key, model in providers:
+        p = {k: v for k, v in payload.items() if k != "reasoning_effort"}
+        p["model"] = model
+        if name == "Groq" and "gpt-oss" in model:
+            p["reasoning_effort"] = GROQ_REASONING
+
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, json=p, headers=headers)
+                if resp.status_code == 200:
+                    logger.info("AI response from %s (%s)", name, model)
+                    return resp.json()
+                elif resp.status_code == 429:
+                    logger.warning("%s rate-limited — trying next provider", name)
+                    last_err = f"{name} rate-limited"
+                    continue
+                else:
+                    logger.warning("%s error %d — trying next", name, resp.status_code)
+                    last_err = f"{name} error {resp.status_code}"
+                    continue
+        except httpx.TimeoutException:
+            logger.warning("%s timed out — trying next", name)
+            last_err = f"{name} timed out"
+            continue
+        except Exception as exc:
+            logger.warning("%s failed: %s — trying next", name, exc)
+            last_err = str(exc)
+            continue
+
+    raise HTTPException(status_code=502, detail=f"All AI providers failed: {last_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -109,16 +182,13 @@ async def web_chat(req: Request):
         {"role": "system", "content": "You are JARVIS, Milo's witty, polite British AI assistant. Address him as sir. Replies are spoken aloud so keep them concise without markdown or lists."},
         {"role": "user", "content": text}
     ]
-    payload = {"model": GROQ_MODEL, "messages": messages}
-    if "gpt-oss" in GROQ_MODEL:
-        payload["reasoning_effort"] = "low"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {"messages": messages}
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(GROQ_CHAT_URL, json=payload, headers=headers)
-        if r.status_code == 200:
-            reply = r.json()["choices"][0]["message"].get("content", "Done, sir.")
-            return {"reply": reply}
+    try:
+        result = await _ai_chat(payload, timeout=60.0)
+        reply = result["choices"][0]["message"].get("content", "Done, sir.")
+        return {"reply": reply}
+    except Exception:
         return {"reply": "I am experiencing high network traffic, sir."}
 
 @app.post("/tts")
@@ -226,70 +296,14 @@ def _write_json(path: Path, data: list) -> None:
 async def chat(body: ChatRequest, authorization: Optional[str] = Header(None)):
     _verify_auth(authorization)
 
-    model = body.model or GROQ_MODEL
-
-    # Build the payload for Groq
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": body.messages,
-    }
-
-    # For gpt-oss models, add low reasoning effort
-    if "gpt-oss" in model:
-        payload["reasoning_effort"] = "low"
+    # Build base payload (model will be set by provider chain)
+    payload: Dict[str, Any] = {"messages": body.messages}
 
     if body.tools:
         payload["tools"] = body.tools
         payload["tool_choice"] = body.tool_choice or "auto"
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    # Retry logic: 4 attempts, exponential backoff (3s, 6s, 12s)
-    backoff_delays = [3, 6, 12]
-    max_attempts = 4
-
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        for attempt in range(max_attempts):
-            try:
-                resp = await client.post(GROQ_CHAT_URL, json=payload, headers=headers)
-
-                if resp.status_code == 429 and attempt < max_attempts - 1:
-                    delay = backoff_delays[attempt]
-                    logger.warning(
-                        "Groq 429 rate-limited — retrying in %ds (attempt %d/%d)",
-                        delay, attempt + 1, max_attempts,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-
-                if resp.status_code >= 400:
-                    logger.error("Groq error %d: %s", resp.status_code, resp.text[:500])
-                    raise HTTPException(
-                        status_code=resp.status_code,
-                        detail={"error": "Groq API error", "body": resp.text[:1000]},
-                    )
-
-                return resp.json()
-
-            except httpx.TimeoutException:
-                logger.error("Groq request timed out (attempt %d/%d)", attempt + 1, max_attempts)
-                if attempt < max_attempts - 1:
-                    await asyncio.sleep(backoff_delays[attempt])
-                    continue
-                raise HTTPException(status_code=504, detail="Groq request timed out")
-
-            except HTTPException:
-                raise  # re-raise our own HTTPExceptions
-
-            except Exception as exc:
-                logger.exception("Unexpected error calling Groq")
-                raise HTTPException(status_code=502, detail=str(exc))
-
-    # Should never reach here, but just in case
-    raise HTTPException(status_code=502, detail="Failed to get response from Groq")
+    return await _ai_chat(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -376,32 +390,12 @@ async def vision(body: VisionRequest, authorization: Optional[str] = Header(None
         }
     ]
 
-    payload = {
-        "model": GROQ_VISION_MODEL,
-        "messages": messages,
-        "max_tokens": 1024,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    payload = {"messages": messages, "max_tokens": 1024}
 
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(GROQ_CHAT_URL, json=payload, headers=headers)
-
-        if resp.status_code >= 400:
-            logger.error("Groq vision error %d: %s", resp.status_code, resp.text[:500])
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail={"error": "Groq vision error", "body": resp.text[:1000]},
-            )
-
-        data = resp.json()
+        data = await _ai_chat(payload, timeout=90.0)
         answer = data["choices"][0]["message"]["content"]
         return {"answer": answer}
-
     except HTTPException:
         raise
     except Exception as exc:
@@ -477,10 +471,15 @@ async def save_history(body: HistoryPayload, authorization: Optional[str] = Head
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 async def health():
+    providers = []
+    if GEMINI_API_KEY:
+        providers.append(f"Gemini ({GEMINI_MODEL})")
+    if GROQ_API_KEY:
+        providers.append(f"Groq ({GROQ_MODEL})")
     return {
         "status": "ok",
-        "model": GROQ_MODEL,
-        "vision_model": GROQ_VISION_MODEL,
+        "providers": providers,
+        "primary_model": GEMINI_MODEL if GEMINI_API_KEY else GROQ_MODEL,
         "uptime": round(time.time() - START_TIME, 1),
     }
 
