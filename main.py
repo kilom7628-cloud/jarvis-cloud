@@ -237,11 +237,13 @@ async def tts(body: TTSRequest, authorization: Optional[str] = Header(None)):
             "latency": "balanced",
         }
         if body.speed is not None:
-            fish_payload["prosody"] = {"speed": body.speed}
+            fish_payload["prosody"] = {"speed": body.speed, "volume": 0}
 
         headers = {
             "Authorization": f"Bearer {FISH_API_KEY}",
             "Content-Type": "application/json",
+            "model": FISH_MODEL,
+            "User-Agent": "jarvis/1.0",
         }
 
         async with httpx.AsyncClient(timeout=60.0) as client:
