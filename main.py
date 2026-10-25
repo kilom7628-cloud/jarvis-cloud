@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -81,6 +82,80 @@ async def startup() -> None:
     if not HISTORY_FILE.exists():
         HISTORY_FILE.write_text("[]", encoding="utf-8")
     logger.info("JARVIS Cloud Server started — model=%s", GROQ_MODEL)
+
+
+# ---------------------------------------------------------------------------
+# Web UI Endpoints (Access JARVIS from any phone / tablet / browser anywhere)
+# ---------------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def serve_ui():
+    ui_path = Path(__file__).parent / "ui.html"
+    if ui_path.exists():
+        return HTMLResponse(ui_path.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>JARVIS Cloud Online</h1>")
+
+@app.post("/chat")
+async def web_chat(req: Request):
+    """Direct chat endpoint for the web UI (used from mobile/tablets/browser)."""
+    try:
+        data = await req.json()
+    except Exception:
+        data = {}
+    text = data.get("text", "")
+    if not text:
+        return {"reply": "Yes, sir?"}
+
+    messages = [
+        {"role": "system", "content": "You are JARVIS, Milo's witty, polite British AI assistant. Address him as sir. Replies are spoken aloud so keep them concise without markdown or lists."},
+        {"role": "user", "content": text}
+    ]
+    payload = {"model": GROQ_MODEL, "messages": messages}
+    if "gpt-oss" in GROQ_MODEL:
+        payload["reasoning_effort"] = "low"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(GROQ_CHAT_URL, json=payload, headers=headers)
+        if r.status_code == 200:
+            reply = r.json()["choices"][0]["message"].get("content", "Done, sir.")
+            return {"reply": reply}
+        return {"reply": "I am experiencing high network traffic, sir."}
+
+@app.post("/tts")
+async def web_tts(req: Request):
+    """Direct TTS endpoint for the web UI."""
+    try:
+        data = await req.json()
+    except Exception:
+        data = {}
+    text = data.get("text", "")
+    fish_payload = {
+        "text": text,
+        "reference_id": FISH_VOICE_ID,
+        "mp3_bitrate": 128,
+        "format": "mp3",
+        "latency": "balanced",
+        "prosody": {"speed": 0.9, "volume": 0}
+    }
+    headers = {
+        "Authorization": f"Bearer {FISH_API_KEY}",
+        "Content-Type": "application/json",
+        "model": FISH_MODEL,
+        "User-Agent": "jarvis/1.0"
+    }
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        r = await client.post(FISH_TTS_URL, json=fish_payload, headers=headers)
+        if r.status_code == 200:
+            return Response(content=r.content, media_type="audio/mpeg")
+    return Response(status_code=500)
+
+@app.get("/events")
+async def web_events():
+    return {"events": [], "last": 0}
+
+@app.post("/cancel")
+async def web_cancel():
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
